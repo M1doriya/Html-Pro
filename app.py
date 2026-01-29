@@ -12,6 +12,127 @@ import zipfile
 import re
 from pathlib import Path
 from typing import List, Tuple
+import pandas as pd
+
+
+# =============================================================================
+# Optional metadata overrides (Account Registry)
+# =============================================================================
+
+def _safe_json_loads(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def load_registry_from_secrets_or_upload(uploaded_registry_file):
+    """
+    Accept either:
+      - Uploaded account_registry.json
+      - Streamlit secret: ACCOUNT_REGISTRY_JSON (string containing JSON)
+
+    Registry format is the same as Part 1 export:
+    {
+      "company": {"name": "...", "keywords": [...], "related_parties": [...]},
+      "accounts": [{"account_id": "...", "bank_name": "...", "account_number": "...", "match": {...}}, ...]
+    }
+    """
+    if uploaded_registry_file is not None:
+        try:
+            return json.load(uploaded_registry_file)
+        except Exception:
+            return None
+
+    # Secrets (optional)
+    try:
+        raw = st.secrets.get("ACCOUNT_REGISTRY_JSON", None)
+        if raw:
+            if isinstance(raw, str):
+                return _safe_json_loads(raw)
+            if isinstance(raw, dict):
+                return raw
+    except Exception:
+        pass
+
+    return None
+
+
+def apply_registry_to_analysis_json(data: dict, registry: dict) -> dict:
+    """
+    Non-destructive: returns a *copy* of data with overrides applied where available.
+    Matching rule:
+      - account_id exact match (preferred)
+      - fallback: match.filename (only if analysis JSON contains report_info.source_filename, uncommon)
+    """
+    if not isinstance(data, dict) or not isinstance(registry, dict):
+        return data
+
+    out = json.loads(json.dumps(data))  # deep copy (JSON-safe)
+    reg_company = (registry.get("company") or {})
+    reg_accounts = registry.get("accounts") or []
+
+    # Company name override (if missing or generic)
+    if reg_company.get("name"):
+        out.setdefault("report_info", {})
+        if not out["report_info"].get("company_name") or out["report_info"].get("company_name") in ["Company", "Unknown", "YOUR COMPANY"]:
+            out["report_info"]["company_name"] = reg_company["name"]
+
+    # Accounts override (by account_id)
+    reg_by_id = {}
+    for a in reg_accounts:
+        if isinstance(a, dict) and a.get("account_id"):
+            reg_by_id[str(a["account_id"])] = a
+
+    accounts = out.get("accounts") or []
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        aid = str(acc.get("account_id") or "")
+        if aid and aid in reg_by_id:
+            r = reg_by_id[aid]
+            # Prefer registry values if present
+            if r.get("bank_name"):
+                acc["bank_name"] = r["bank_name"]
+            if r.get("account_number"):
+                acc["account_number"] = r["account_number"]
+            if r.get("classification"):
+                acc["classification"] = r["classification"]
+            if r.get("account_type"):
+                acc["account_type"] = r["account_type"]
+            # account_holder (if company known)
+            if out.get("report_info", {}).get("company_name"):
+                acc["account_holder"] = out["report_info"]["company_name"]
+
+    out["accounts"] = accounts
+    return out
+
+
+def apply_manual_overrides(data: dict, company_override: str, account_rows: List[dict]) -> dict:
+    """
+    Non-destructive: returns a copy with UI overrides applied.
+    account_rows expects list with keys: account_id, bank_name, account_number, classification, account_type (optional).
+    """
+    out = json.loads(json.dumps(data))
+    if company_override:
+        out.setdefault("report_info", {})
+        out["report_info"]["company_name"] = company_override
+
+    by_id = {str(r.get("account_id")): r for r in (account_rows or []) if r.get("account_id")}
+    accounts = out.get("accounts") or []
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        aid = str(acc.get("account_id") or "")
+        if aid in by_id:
+            r = by_id[aid]
+            for k in ["bank_name", "account_number", "classification", "account_type"]:
+                v = r.get(k)
+                if v not in (None, ""):
+                    acc[k] = v
+    out["accounts"] = accounts
+    return out
+
 
 
 
@@ -60,35 +181,6 @@ def generate_interactive_html(data):
     categories = data.get('categories', {})
     volatility = data.get('volatility', {})
     flags = data.get('flags', {})
-    # v5.2.x compatibility: some schemas store round-figure review items under 'flagged_for_review'
-    flagged_for_review = data.get('flagged_for_review', {})
-    if isinstance(flagged_for_review, dict) and flagged_for_review:
-        if not isinstance(flags, dict):
-            flags = {}
-        # If 'flags.round_figure_transactions' is missing, derive it from 'flagged_for_review'
-        if not flags.get('round_figure_transactions'):
-            items = flagged_for_review.get('all_items') or flagged_for_review.get('top_10_items') or []
-            if not isinstance(items, list):
-                items = []
-            converted = []
-            for t in items:
-                if isinstance(t, dict):
-                    converted.append({
-                        'date': t.get('date',''),
-                        'description': t.get('description',''),
-                        'type': t.get('type','CREDIT'),
-                        'amount': t.get('amount',0),
-                        'account': t.get('account',''),
-                        'counterparty': t.get('counterparty',''),
-                        'flag_reason': t.get('flag_reason',''),
-                    })
-            flags['round_figure_transactions'] = {
-                'count': flagged_for_review.get('count', len(converted)),
-                'total_amount': flagged_for_review.get('total_amount', 0),
-                'all_transactions': converted,
-                'top_10_transactions': converted[:10],
-                'note': flagged_for_review.get('note',''),
-            }
     kite = data.get('kite_flying', {})
     integrity = data.get('integrity_score', {})
     observations = data.get('observations', {})
@@ -1221,6 +1313,17 @@ st.title('🏦 Bank Statement Analysis → Interactive HTML')
 st.caption('Upload one or many v5.x analysis JSON files, then download interactive HTML reports (compatible with v4.0 too).')
 
 
+# Sidebar: optional registry + quick overrides
+with st.sidebar:
+    st.header("Optional: Account Registry")
+    registry_file = st.file_uploader("Upload account_registry.json (optional)", type=["json"], accept_multiple_files=False)
+    company_override_sidebar = st.text_input("Override company name (optional)", value="", help="If set, it will replace report_info.company_name for generated HTML.")
+    st.caption("Tip: You can also store the registry in Streamlit Secrets as ACCOUNT_REGISTRY_JSON.")
+
+_registry = load_registry_from_secrets_or_upload(registry_file)
+
+
+
 # If this page is used inside a MULTI-PAGE app together with Part 1,
 # you can pass analysis JSON objects via st.session_state['analysis_outputs']
 # (list of dicts OR list of (name, dict)). This avoids re-uploading.
@@ -1264,6 +1367,20 @@ if errors:
 if not parsed:
     st.stop()
 
+
+# Apply registry/company override to all loaded JSONs (non-destructive)
+if _registry or (company_override_sidebar and company_override_sidebar.strip()):
+    updated = []
+    for name, d in parsed:
+        dd = d
+        if _registry:
+            dd = apply_registry_to_analysis_json(dd, _registry)
+        if company_override_sidebar and company_override_sidebar.strip():
+            dd = apply_manual_overrides(dd, company_override_sidebar.strip(), [])
+        updated.append((name, dd))
+    parsed = updated
+
+
 st.success(f"✅ Loaded {len(parsed)} file(s)")
 
 
@@ -1281,10 +1398,58 @@ st.markdown('## 📥 Downloads')
 
 # Single vs multiple behavior
 if len(parsed) == 1:
-    filename, data = parsed[0]
+    filename, data_original = parsed[0]
+    data = data_original  # working copy
+
     schema_version = detect_schema_version(data)
     company = data.get('report_info', {}).get('company_name', 'Unknown')
     base = _report_basename(data, fallback=_slugify(Path(filename).stem))
+
+    # Optional: in-app overrides (useful if Part 1 produced Unknown metadata)
+    with st.expander('🛠️ Optional: override metadata for this report', expanded=False):
+        company_override_ui = st.text_input(
+            'Company name (override)',
+            value=company,
+            key='company_override_ui_single',
+            help='Overrides report_info.company_name for this generated output only.',
+        )
+
+        accounts_list = data.get('accounts', []) or []
+        account_rows = []
+        if accounts_list:
+            df_accounts = pd.DataFrame([
+                {
+                    'account_id': a.get('account_id', ''),
+                    'bank_name': a.get('bank_name', ''),
+                    'account_number': a.get('account_number', ''),
+                    'classification': a.get('classification', 'SECONDARY'),
+                    'account_type': a.get('account_type', 'Current'),
+                }
+                for a in accounts_list
+                if isinstance(a, dict)
+            ])
+
+            edited_accounts = st.data_editor(
+                df_accounts,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    'account_id': st.column_config.TextColumn('Account ID', disabled=True),
+                    'bank_name': st.column_config.TextColumn('Bank name'),
+                    'account_number': st.column_config.TextColumn('Account number'),
+                    'classification': st.column_config.SelectboxColumn('Classification', options=['PRIMARY', 'SECONDARY'], default='SECONDARY'),
+                    'account_type': st.column_config.SelectboxColumn('Account type', options=['Current', 'Savings', 'Overdraft', 'Other'], default='Current'),
+                },
+            )
+            account_rows = edited_accounts.to_dict(orient='records')
+        else:
+            st.info('No accounts[] array found in this JSON.')
+
+        data = apply_manual_overrides(data, company_override_ui.strip(), account_rows)
+        schema_version = detect_schema_version(data)
+        base = _report_basename(data, fallback=_slugify(Path(filename).stem))
+
+        st.caption('Overrides apply only to the downloads below; your uploaded JSON file is unchanged.')
 
     c1, c2 = st.columns(2)
     with c1:
